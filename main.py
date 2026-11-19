@@ -2,19 +2,49 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
-import glob
+import time
+import random
 from datetime import datetime, timedelta
 
+# ============================================================
+# 설정 - 여기서만 바꾸면 됨
+# ============================================================
 TICKERS = ["DKNG", "RKLB", "WULF", "SOXL", "META", "BE"]
-DAYS_LIMIT = 365
+DAYS_LIMIT = 365  # 만기 1년 이내만
+WHALE_PREMIUM = 1000000  # 이 금액 이상이면 고래로 판단
+UNUSUAL_VOL_OI = 1.0  # Volume / OI 비율
+WALL_SHARE = 0.15  # 전체 OI 중 한 행사가가 차지하면 벽으로 판단
 
-# --- 설정값 ---
-WHALE_PREMIUM = 1000000  # 이 금액 이상 거래되면 고래로 판단 (달러)
-UNUSUAL_VOL_OI = 1.0     # Volume / OI 비율
-WALL_SHARE = 0.15        # 전체 OI 중 한 행사가가 차지하면 벽으로 판단
+# ============================================================
+# 야후 차단 회피용 세션 - 건드리지 말 것
+# ============================================================
+try:
+    from curl_cffi import requests as cffi_requests
+    SESSION = cffi_requests.Session(impersonate="chrome")
+    print("curl_cffi 세션 사용")
+except Exception as e:
+    SESSION = None
+    print(f"curl_cffi 없음, 기본 세션 사용: {e}")
+
+def get_ticker_with_retry(symbol, max_retry=3):
+    for attempt in range(max_retry):
+        try:
+            ticker = yf.Ticker(symbol, session=SESSION) if SESSION else yf.Ticker(symbol)
+            opts = ticker.options
+            if opts and len(opts) > 0:
+                return ticker
+            print(f"  {symbol} 옵션 목록 비어있음, {attempt+1}회 재시도...")
+        except Exception as e:
+            print(f"  {symbol} {attempt+1}회 실패: {str(e)[:200]}")
+        time.sleep(2 + random.uniform(0, 3))
+    return None
 
 def get_all_options(ticker_symbol):
-    ticker = yf.Ticker(ticker_symbol)
+    ticker = get_ticker_with_retry(ticker_symbol)
+    if ticker is None:
+        print(f"!!! {ticker_symbol} 가져오기 실패 - 건너뜀")
+        return None, 0
+
     try:
         current_price = ticker.fast_info.get('lastPrice', 0)
         if not current_price:
@@ -27,11 +57,18 @@ def get_all_options(ticker_symbol):
     all_rows = []
     print(f"--- {ticker_symbol} 수집 시작 (현재가: {current_price}) ---")
 
-    for exp_str in ticker.options:
+    try:
+        all_exps = ticker.options
+    except Exception as e:
+        print(f"  {ticker_symbol} 만기 목록 실패: {e}")
+        return None, current_price
+
+    for exp_str in all_exps:
         try:
             exp_date = datetime.strptime(exp_str, "%Y-%m-%d")
             if exp_date > limit_date:
                 continue
+            time.sleep(0.5)
             chain = ticker.option_chain(exp_str)
             for df_part, typ in [(chain.calls, 'CALL'), (chain.puts, 'PUT')]:
                 d = df_part.copy()
@@ -40,13 +77,12 @@ def get_all_options(ticker_symbol):
                 d['ticker'] = ticker_symbol
                 d['current_price'] = current_price
                 d['days_to_expiry'] = (exp_date - today).days
-                # 프리미엄 추정 = 거래량 * 중간가 * 100 (옵션 1계약 = 100주)
                 d['mid_price'] = (d['bid'].fillna(0) + d['ask'].fillna(0)) / 2
                 d['premium_est'] = d['volume'].fillna(0) * d['mid_price'] * 100
                 d['vol_oi_ratio'] = d['volume'].fillna(0) / d['openInterest'].replace(0, np.nan).fillna(0)
                 all_rows.append(d)
         except Exception as e:
-            print(f"  {exp_str} 실패: {e}")
+            print(f"  {exp_str} 실패 (건너뜀): {str(e)[:150]}")
             continue
 
     if not all_rows:
@@ -63,14 +99,11 @@ def calc_wall_and_pain(df_exp):
     call_wall_row = calls.loc[calls['openInterest'].idxmax()]
     put_wall_row = puts.loc[puts['openInterest'].idxmax()]
 
-    # 맥스페인
     strikes = np.sort(df_exp['strike'].unique())
     call_pain = np.maximum(0, strikes[:, None] - calls['strike'].values[None, :]) @ calls['openInterest'].values
     put_pain = np.maximum(0, puts['strike'].values[None, :] - strikes[:, None]) @ puts['openInterest'].values
     max_pain_price = strikes[np.argmin(call_pain + put_pain)]
 
-    # 감마 노출 근사치 (ATM 근처 OI가 많을수록 딜러 헤지 압력 큼)
-    # 여기선 간단히 전체 OI 합으로 대체
     total_call_oi = calls['openInterest'].sum()
     total_put_oi = puts['openInterest'].sum()
     pc_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
@@ -88,11 +121,9 @@ def calc_wall_and_pain(df_exp):
     }
 
 def detect_whale_and_unusual(df_exp, current_price):
-    """이상거래 / 고래 탐지 - 한 만기 기준"""
     alerts = []
     df_exp = df_exp.fillna(0)
 
-    # 1. 고래 프리미엄 거래
     whales = df_exp[df_exp['premium_est'] >= WHALE_PREMIUM].sort_values('premium_est', ascending=False)
     for _, r in whales.head(5).iterrows():
         alerts.append({
@@ -103,10 +134,9 @@ def detect_whale_and_unusual(df_exp, current_price):
             'type': r['type']
         })
 
-    # 2. Volume/OI 이상
     unusual = df_exp[df_exp['vol_oi_ratio'] >= UNUSUAL_VOL_OI].sort_values('vol_oi_ratio', ascending=False)
     for _, r in unusual.head(5).iterrows():
-        if r['premium_est'] < 200000:  # 너무 작은 금액은 노이즈라 제외
+        if r['premium_est'] < 200000:
             continue
         alerts.append({
             'level': 'UNUSUAL',
@@ -116,7 +146,6 @@ def detect_whale_and_unusual(df_exp, current_price):
             'type': r['type']
         })
 
-    # 3. OI 집중도 - 한 행사가에 몰린 벽
     total_oi = df_exp['openInterest'].sum()
     if total_oi > 0:
         grouped = df_exp.groupby(['type', 'strike'])['openInterest'].sum().reset_index()
@@ -133,7 +162,6 @@ def detect_whale_and_unusual(df_exp, current_price):
     return alerts
 
 def predict_direction(summary_row, current_price):
-    """예측 점수 -100(강한 하락) ~ +100(강한 상승)"""
     score = 0
     reasons = []
     cw = summary_row['call_wall']
@@ -141,7 +169,6 @@ def predict_direction(summary_row, current_price):
     mp = summary_row['max_pain']
     pcr = summary_row['put_call_ratio']
 
-    # 1. 맥스페인 끌어당김 (만기 가까울수록 가중치 UP)
     dte = summary_row['days_to_expiry']
     weight = 1.5 if dte <= 7 else 1.0 if dte <= 30 else 0.5
     if mp > current_price:
@@ -151,7 +178,6 @@ def predict_direction(summary_row, current_price):
         score -= 25 * weight
         reasons.append(f"맥스페인({mp})이 현재가보다 아래 -> 아래로 끌어당김")
 
-    # 2. 벽까지 거리
     dist_call = (cw - current_price) / current_price * 100 if current_price else 0
     dist_put = (current_price - pw) / current_price * 100 if current_price else 0
     if dist_call < 2:
@@ -161,15 +187,13 @@ def predict_direction(summary_row, current_price):
         score += 20
         reasons.append(f"풋월({pw})까지 {dist_put:.1f}%밖에 안남음 -> 지지 강함")
 
-    # 3. Put/Call 비율
     if pcr > 1.2:
         score -= 15
-        reasons.append(f"Put/Call {pcr}로 풋 쏠림 -> 공포 / 하락 베팅 많음 (역발상으론 바닥 신호일 수도)")
+        reasons.append(f"Put/Call {pcr}로 풋 쏠림 -> 공포 / 하락 베팅 많음")
     elif pcr < 0.7:
         score += 15
         reasons.append(f"Put/Call {pcr}로 콜 쏠림 -> 강세 베팅 많음")
 
-    # 4. 위치
     if current_price > cw:
         score += 10
         reasons.append("콜월 돌파 중 -> 상승 모멘텀")
@@ -183,7 +207,7 @@ def predict_direction(summary_row, current_price):
     elif score >= 10:
         verdict = "🟢 약한 상승 우위"
     elif score <= -40:
-        verdict = "🔴 강세 하락 우위" if False else "🔴 약세 우위"
+        verdict = "🔴 약세 우위"
     elif score <= -10:
         verdict = "🔴 약한 하락 우위"
     else:
@@ -199,8 +223,13 @@ def main():
     predict_rows = []
 
     for ticker_symbol in TICKERS:
-        df, current_price = get_all_options(ticker_symbol)
+        try:
+            df, current_price = get_all_options(ticker_symbol)
+        except Exception as e:
+            print(f"!!! {ticker_symbol} 전체 실패 - 건너뜀: {e}")
+            continue
         if df is None or df.empty:
+            print(f"{ticker_symbol} 데이터 없음 - 건너뜀")
             continue
 
         cols = ['ticker','expiration','days_to_expiry','type','strike','lastPrice','bid','ask',
@@ -208,7 +237,6 @@ def main():
         cols = [c for c in cols if c in df.columns]
         df[cols].to_csv(f'data/{today_str}_{ticker_symbol}.csv', index=False)
 
-        # 만기 1년 이내 전부 요약 (전부 다!)
         for exp in sorted(df['expiration'].unique()):
             df_exp = df[df['expiration'] == exp]
             result = calc_wall_and_pain(df_exp)
@@ -222,13 +250,11 @@ def main():
             }
             summary_rows.append(row)
 
-            # 이상거래 / 고래 탐지 (D-day 45일 이내 만기만 집중 - 너무 먼 만기는 노이즈)
             if dte <= 45:
                 alerts = detect_whale_and_unusual(df_exp, current_price)
                 for a in alerts:
                     alert_rows.append({'date': today_str, 'ticker': ticker_symbol, 'expiration': exp, 'days_to_expiry': dte, **a})
 
-            # 예측은 가장 가까운 만기 3개만
             if exp in sorted(df['expiration'].unique())[:3]:
                 score, verdict, reasons = predict_direction(row, current_price)
                 predict_rows.append({
@@ -253,7 +279,6 @@ def main():
     if not predict_df.empty:
         predict_df.to_csv(f'data/{today_str}_predict.csv', index=False)
 
-    # summary.md 만들기 - 깃허브에서 바로 보기
     with open('summary.md', 'w', encoding='utf-8') as f:
         f.write(f"# Option Wall + Whale + 예측 - {today_str}\n\n")
         f.write("> ⚠️ 이 예측은 옵션 포지셔닝 기반 참고용입니다. 확정적인 방향이 아닙니다. 현물 거래의 보조 지표로만 사용하세요.\n\n")
