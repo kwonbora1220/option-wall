@@ -205,18 +205,20 @@ def get_current_price(ticker_symbol):
                     return close
     except Exception as e:
         print(f"  현재가 stooq 실패: {e}")
-    try:
-        r = requests.get(f"https://api.nasdaq.com/api/quote/{ticker_symbol}/info?assetclass=stocks", headers={**HEADERS, "Accept-Language": "en-US"}, timeout=15)
-        if r.status_code == 200:
-            j = r.json()
-            if j and isinstance(j, dict):
-                d = j.get("data") or {}
-                pd_data = d.get("primaryData") or {}
-                price = str(pd_data.get("lastSalePrice", "")).replace("$", "").replace(",", "")
-                if price:
-                    return safe_float(price)
-    except Exception as e:
-        print(f"  현재가 nasdaq 실패: {e}")
+    # Nasdaq에서 stocks -> etf 순서로 둘 다 시도 (SOXL은 etf)
+    for asset in ["stocks", "etf"]:
+        try:
+            r = requests.get(f"https://api.nasdaq.com/api/quote/{ticker_symbol}/info?assetclass={asset}", headers={**HEADERS, "Accept-Language": "en-US"}, timeout=15)
+            if r.status_code == 200:
+                j = r.json()
+                if j and isinstance(j, dict):
+                    d = j.get("data") or {}
+                    pd_data = d.get("primaryData") or {}
+                    price = str(pd_data.get("lastSalePrice", "")).replace("$", "").replace(",", "")
+                    if price:
+                        return safe_float(price)
+        except Exception as e:
+            print(f"  현재가 nasdaq({asset}) 실패: {e}")
     return 0
 
 def calc_wall_and_pain(df_exp):
