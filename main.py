@@ -5,9 +5,6 @@ import os
 import time
 from datetime import datetime, timedelta
 
-# ============================================================
-# 설정 - 여기서만 바꾸면 됨
-# ============================================================
 TICKERS = ["DKNG", "RKLB", "WULF", "SOXL", "META", "BE"]
 DAYS_LIMIT = 365
 WHALE_PREMIUM = 1000000
@@ -19,8 +16,23 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+def safe_float(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except:
+        return default
+
+def safe_int(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(v))
+    except:
+        return default
+
 def get_all_options(ticker_symbol):
-    """CBOE에서 1년 이내 모든 옵션 가져오기 - 야후 사용 안함"""
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
     print(f"--- {ticker_symbol} CBOE에서 수집 시작 ---")
     try:
@@ -35,41 +47,69 @@ def get_all_options(ticker_symbol):
 
     options = data.get("data", {}).get("options", [])
     if not options:
-        print(f"  {ticker_symbol} 옵션 데이터 없음")
+        print(f"  {ticker_symbol} 옵션 데이터 없음 - data 키 확인: {list(data.get('data', {}).keys())[:10]}")
         return None, 0
+
+    # 디버그: 첫 번째 옵션 원본 그대로 출력 - 형식을 눈으로 확인하기 위함
+    print(f"  {ticker_symbol} 샘플 원본: {options[0]}")
 
     today = datetime.now()
     limit_date = today + timedelta(days=DAYS_LIMIT)
     rows = []
-
-    # 현재가 = 가장 가까운 만기 ATM 근처 옵션의 underlying 가격으로 추정
-    # CBOE 데이터에 underlying이 없으므로, 별도로 현재가 가져오기
     current_price = get_current_price(ticker_symbol)
     print(f"  {ticker_symbol} 현재가: {current_price}, 전체 옵션 수: {len(options)}")
 
+    skipped_no_exp = 0
+    skipped_no_type = 0
+    skipped_date = 0
+
     for o in options:
         try:
-            # CBOE 날짜 형식: 2026-11-27T00:00:00
-            exp_str = o.get("expiration_date", "")[:10]
-            if not exp_str:
+            # 날짜: 여러 가지 필드명을 다 시도
+            exp_raw = o.get("expiration_date") or o.get("expiration") or o.get("expiry_date") or o.get("expiry") or ""
+            exp_raw = str(exp_raw)
+            if not exp_raw:
+                skipped_no_exp += 1
                 continue
-            exp_date = datetime.strptime(exp_str, "%Y-%m-%d")
+            # "2026-11-27T00:00:00" -> "2026-11-27" 로 자르기
+            exp_str = exp_raw[:10]
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d")
+            except:
+                # "11/27/2026" 같은 형태도 시도
+                try:
+                    exp_date = datetime.strptime(exp_str, "%m/%d/%Y")
+                    exp_str = exp_date.strftime("%Y-%m-%d")
+                except:
+                    skipped_date += 1
+                    continue
+
             if exp_date > limit_date:
                 continue
             if exp_date < today - timedelta(days=1):
                 continue
 
-            opt_type = o.get("option_type", "").upper()  # CALL / PUT
-            if opt_type not in ["CALL", "PUT"]:
+            # 타입: 여러 필드명 다 시도, 대소문자 무시
+            opt_type_raw = o.get("option_type") or o.get("type") or o.get("put_call") or o.get("call_put") or ""
+            opt_type_raw = str(opt_type_raw).upper()
+            if "CALL" in opt_type_raw or opt_type_raw == "C":
+                opt_type = "CALL"
+            elif "PUT" in opt_type_raw or opt_type_raw == "P":
+                opt_type = "PUT"
+            else:
+                skipped_no_type += 1
                 continue
 
-            strike = float(o.get("strike_price", 0) or 0)
-            bid = float(o.get("bid", 0) or 0)
-            ask = float(o.get("ask", 0) or 0)
-            vol = int(o.get("volume", 0) or 0)
-            oi = int(o.get("open_interest", 0) or 0)
-            last = float(o.get("last_trade_price", 0) or 0)
-            iv = float(o.get("implied_volatility", 0) or 0)
+            strike = safe_float(o.get("strike_price", o.get("strike", 0)))
+            if strike <= 0:
+                continue
+
+            bid = safe_float(o.get("bid", 0))
+            ask = safe_float(o.get("ask", 0))
+            vol = safe_int(o.get("volume", 0))
+            oi = safe_int(o.get("open_interest", o.get("openInterest", 0)))
+            last = safe_float(o.get("last_trade_price", o.get("last_price", o.get("last", 0))))
+            iv = safe_float(o.get("implied_volatility", o.get("iv", 0)))
 
             mid = (bid + ask) / 2
             rows.append({
@@ -89,41 +129,38 @@ def get_all_options(ticker_symbol):
                 'vol_oi_ratio': vol / oi if oi > 0 else 0,
                 'current_price': current_price,
             })
-        except Exception:
+        except Exception as e:
             continue
+
+    print(f"  {ticker_symbol} 파싱 결과: 성공 {len(rows)}개, 날짜없음 {skipped_no_exp}, 타입없음 {skipped_no_type}, 날짜형식실패 {skipped_date}")
 
     if not rows:
         return None, current_price
     return pd.DataFrame(rows), current_price
 
 def get_current_price(ticker_symbol):
-    """현재가 가져오기 - CBOE 주가 API (야후 안씀)"""
-    # 1순위: CBOE 주가
     try:
-        url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
-        # 주가용은 따로 stock API 사용
-        url2 = f"https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_SPX.json"
-        # 간단하게 stooq 무료 API 사용
         r = requests.get(f"https://stooq.com/q/l/?s={ticker_symbol.lower()}.us&f=sd2t2ohlcv&h&e=csv", headers=HEADERS, timeout=15)
         if r.status_code == 200 and "N/D" not in r.text:
             lines = r.text.strip().split("\n")
             if len(lines) >= 2:
                 parts = lines[1].split(",")
-                # stooq: Symbol,Date,Time,Open,High,Low,Close,Volume
-                close = float(parts[6])
+                close = safe_float(parts[6] if len(parts) > 6 else 0)
                 if close > 0:
                     return close
     except Exception as e:
         print(f"  현재가 stooq 실패: {e}")
 
-    # 2순위: Nasdaq 현재가
     try:
         r = requests.get(f"https://api.nasdaq.com/api/quote/{ticker_symbol}/info?assetclass=stocks", headers={**HEADERS, "Accept-Language": "en-US"}, timeout=15)
         if r.status_code == 200:
-            price = r.json().get("data", {}).get("primaryData", {}).get("lastSalePrice", "")
-            price = price.replace("$", "").replace(",", "")
-            if price:
-                return float(price)
+            j = r.json()
+            if j and isinstance(j, dict):
+                d = j.get("data") or {}
+                pd_data = d.get("primaryData") or {}
+                price = str(pd_data.get("lastSalePrice", "")).replace("$", "").replace(",", "")
+                if price:
+                    return safe_float(price)
     except Exception as e:
         print(f"  현재가 nasdaq 실패: {e}")
     return 0
