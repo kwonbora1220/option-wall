@@ -15,21 +15,11 @@ WHALE_PREMIUM = 1000000  # 이 금액 이상이면 고래로 판단
 UNUSUAL_VOL_OI = 1.0  # Volume / OI 비율
 WALL_SHARE = 0.15  # 전체 OI 중 한 행사가가 차지하면 벽으로 판단
 
-# ============================================================
-# 야후 차단 회피용 세션 - 건드리지 말 것
-# ============================================================
-try:
-    from curl_cffi import requests as cffi_requests
-    SESSION = cffi_requests.Session(impersonate="chrome")
-    print("curl_cffi 세션 사용")
-except Exception as e:
-    SESSION = None
-    print(f"curl_cffi 없음, 기본 세션 사용: {e}")
-
 def get_ticker_with_retry(symbol, max_retry=3):
     for attempt in range(max_retry):
         try:
-            ticker = yf.Ticker(symbol, session=SESSION) if SESSION else yf.Ticker(symbol)
+            # 세션을 넣지 않음 - yfinance 기본값 사용 (이게 제일 안정적)
+            ticker = yf.Ticker(symbol)
             opts = ticker.options
             if opts and len(opts) > 0:
                 return ticker
