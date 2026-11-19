@@ -1,0 +1,70 @@
+"""텔레그램 전송 전용 스크립트.
+main.py가 만든 data/telegram/part_*.txt를 순서대로 보낸다.
+- 한 메시지 = 파일 1개, 파일이 4096자를 넘으면 그 안에서만 줄 단위로 쪼갠다.
+- 그래서 BE가 마지막이라서 잘리는 일이 없다. 몇 개든 1/N, 2/N... 으로 다 간다.
+- 마지막에 summary.md 원본을 문서로도 보내서, 혹시 잘려도 파일로 전부 확인 가능.
+사용법: python send_telegram.py
+환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+"""
+import os
+import glob
+import time
+import requests
+
+TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+BASE = f'https://api.telegram.org/bot{TOKEN}'
+MAX_LEN = 3900  # 텔레그램 제한 4096, 여유 둠
+
+
+def send_text(text):
+    r = requests.post(f'{BASE}/sendMessage', json={
+        'chat_id': CHAT_ID, 'text': text, 'disable_web_page_preview': True,
+    }, timeout=30)
+    print('sendMessage:', r.status_code, r.text[:300])
+    if r.status_code != 200:
+        raise SystemExit(f'Telegram send failed: {r.text[:500]}')
+    time.sleep(0.5)
+
+
+def split_by_lines(text):
+    """긴 파일을 줄 단위로 쪼갠다. 표 행 중간에서 절대 안 자른다."""
+    chunks, cur = [], ''
+    for line in text.splitlines(True):
+        while len(line) > MAX_LEN:
+            chunks.append(line[:MAX_LEN])
+            line = line[MAX_LEN:]
+        if len(cur) + len(line) > MAX_LEN:
+            chunks.append(cur)
+            cur = ''
+        cur += line
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
+def main():
+    files = sorted(glob.glob('data/telegram/part_*.txt'))
+    if not files:
+        print('텔레그램 섹션 파일 없음 - main.py가 먼저 실행돼야 함')
+        return
+    # 전체 메시지 수 미리 계산 (헤더에 1/N 표시용)
+    all_chunks = []
+    for fp in files:
+        with open(fp, encoding='utf-8') as f:
+            all_chunks.extend(split_by_lines(f.read()))
+    total = len(all_chunks)
+    print(f'총 {total}개 메시지로 전송 (파일 {len(files)}개)')
+    for i, chunk in enumerate(all_chunks, 1):
+        header = f'📊 오늘 옵션월 리포트 ({i}/{total})\n\n' if total > 1 else '📊 오늘 옵션월 리포트\n\n'
+        send_text(header + chunk)
+    # 원본 전체를 문서로도 전송 (잘림 방지용 백업)
+    with open('summary.md', 'rb') as f:
+        r = requests.post(f'{BASE}/sendDocument', data={
+            'chat_id': CHAT_ID, 'caption': '📄 전체 리포트 원본 (summary.md)',
+        }, files={'document': ('summary.md', f)}, timeout=60)
+    print('sendDocument:', r.status_code, r.text[:300])
+
+
+if __name__ == '__main__':
+    main()
