@@ -1,83 +1,132 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
 import os
 import time
-import random
 from datetime import datetime, timedelta
 
 # ============================================================
 # 설정 - 여기서만 바꾸면 됨
 # ============================================================
 TICKERS = ["DKNG", "RKLB", "WULF", "SOXL", "META", "BE"]
-DAYS_LIMIT = 365  # 만기 1년 이내만
-WHALE_PREMIUM = 1000000  # 이 금액 이상이면 고래로 판단
-UNUSUAL_VOL_OI = 1.0  # Volume / OI 비율
-WALL_SHARE = 0.15  # 전체 OI 중 한 행사가가 차지하면 벽으로 판단
+DAYS_LIMIT = 365
+WHALE_PREMIUM = 1000000
+UNUSUAL_VOL_OI = 1.0
+WALL_SHARE = 0.15
 
-def get_ticker_with_retry(symbol, max_retry=3):
-    for attempt in range(max_retry):
-        try:
-            # 세션을 넣지 않음 - yfinance 기본값 사용 (이게 제일 안정적)
-            ticker = yf.Ticker(symbol)
-            opts = ticker.options
-            if opts and len(opts) > 0:
-                return ticker
-            print(f"  {symbol} 옵션 목록 비어있음, {attempt+1}회 재시도...")
-        except Exception as e:
-            print(f"  {symbol} {attempt+1}회 실패: {str(e)[:200]}")
-        time.sleep(2 + random.uniform(0, 3))
-    return None
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept": "application/json",
+}
 
 def get_all_options(ticker_symbol):
-    ticker = get_ticker_with_retry(ticker_symbol)
-    if ticker is None:
-        print(f"!!! {ticker_symbol} 가져오기 실패 - 건너뜀")
+    """CBOE에서 1년 이내 모든 옵션 가져오기 - 야후 사용 안함"""
+    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
+    print(f"--- {ticker_symbol} CBOE에서 수집 시작 ---")
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            print(f"  {ticker_symbol} CBOE 응답 실패: {r.status_code}")
+            return None, 0
+        data = r.json()
+    except Exception as e:
+        print(f"  {ticker_symbol} CBOE 요청 실패: {e}")
         return None, 0
 
-    try:
-        current_price = ticker.fast_info.get('lastPrice', 0)
-        if not current_price:
-            current_price = ticker.info.get('currentPrice', 0) or 0
-    except:
-        current_price = 0
+    options = data.get("data", {}).get("options", [])
+    if not options:
+        print(f"  {ticker_symbol} 옵션 데이터 없음")
+        return None, 0
 
     today = datetime.now()
     limit_date = today + timedelta(days=DAYS_LIMIT)
-    all_rows = []
-    print(f"--- {ticker_symbol} 수집 시작 (현재가: {current_price}) ---")
+    rows = []
 
-    try:
-        all_exps = ticker.options
-    except Exception as e:
-        print(f"  {ticker_symbol} 만기 목록 실패: {e}")
-        return None, current_price
+    # 현재가 = 가장 가까운 만기 ATM 근처 옵션의 underlying 가격으로 추정
+    # CBOE 데이터에 underlying이 없으므로, 별도로 현재가 가져오기
+    current_price = get_current_price(ticker_symbol)
+    print(f"  {ticker_symbol} 현재가: {current_price}, 전체 옵션 수: {len(options)}")
 
-    for exp_str in all_exps:
+    for o in options:
         try:
+            # CBOE 날짜 형식: 2026-11-27T00:00:00
+            exp_str = o.get("expiration_date", "")[:10]
+            if not exp_str:
+                continue
             exp_date = datetime.strptime(exp_str, "%Y-%m-%d")
             if exp_date > limit_date:
                 continue
-            time.sleep(0.5)
-            chain = ticker.option_chain(exp_str)
-            for df_part, typ in [(chain.calls, 'CALL'), (chain.puts, 'PUT')]:
-                d = df_part.copy()
-                d['type'] = typ
-                d['expiration'] = exp_str
-                d['ticker'] = ticker_symbol
-                d['current_price'] = current_price
-                d['days_to_expiry'] = (exp_date - today).days
-                d['mid_price'] = (d['bid'].fillna(0) + d['ask'].fillna(0)) / 2
-                d['premium_est'] = d['volume'].fillna(0) * d['mid_price'] * 100
-                d['vol_oi_ratio'] = d['volume'].fillna(0) / d['openInterest'].replace(0, np.nan).fillna(0)
-                all_rows.append(d)
-        except Exception as e:
-            print(f"  {exp_str} 실패 (건너뜀): {str(e)[:150]}")
+            if exp_date < today - timedelta(days=1):
+                continue
+
+            opt_type = o.get("option_type", "").upper()  # CALL / PUT
+            if opt_type not in ["CALL", "PUT"]:
+                continue
+
+            strike = float(o.get("strike_price", 0) or 0)
+            bid = float(o.get("bid", 0) or 0)
+            ask = float(o.get("ask", 0) or 0)
+            vol = int(o.get("volume", 0) or 0)
+            oi = int(o.get("open_interest", 0) or 0)
+            last = float(o.get("last_trade_price", 0) or 0)
+            iv = float(o.get("implied_volatility", 0) or 0)
+
+            mid = (bid + ask) / 2
+            rows.append({
+                'ticker': ticker_symbol,
+                'expiration': exp_str,
+                'days_to_expiry': (exp_date - today).days,
+                'type': opt_type,
+                'strike': strike,
+                'lastPrice': last,
+                'bid': bid,
+                'ask': ask,
+                'volume': vol,
+                'openInterest': oi,
+                'impliedVolatility': iv,
+                'mid_price': mid,
+                'premium_est': vol * mid * 100,
+                'vol_oi_ratio': vol / oi if oi > 0 else 0,
+                'current_price': current_price,
+            })
+        except Exception:
             continue
 
-    if not all_rows:
+    if not rows:
         return None, current_price
-    return pd.concat(all_rows), current_price
+    return pd.DataFrame(rows), current_price
+
+def get_current_price(ticker_symbol):
+    """현재가 가져오기 - CBOE 주가 API (야후 안씀)"""
+    # 1순위: CBOE 주가
+    try:
+        url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker_symbol}.json"
+        # 주가용은 따로 stock API 사용
+        url2 = f"https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_SPX.json"
+        # 간단하게 stooq 무료 API 사용
+        r = requests.get(f"https://stooq.com/q/l/?s={ticker_symbol.lower()}.us&f=sd2t2ohlcv&h&e=csv", headers=HEADERS, timeout=15)
+        if r.status_code == 200 and "N/D" not in r.text:
+            lines = r.text.strip().split("\n")
+            if len(lines) >= 2:
+                parts = lines[1].split(",")
+                # stooq: Symbol,Date,Time,Open,High,Low,Close,Volume
+                close = float(parts[6])
+                if close > 0:
+                    return close
+    except Exception as e:
+        print(f"  현재가 stooq 실패: {e}")
+
+    # 2순위: Nasdaq 현재가
+    try:
+        r = requests.get(f"https://api.nasdaq.com/api/quote/{ticker_symbol}/info?assetclass=stocks", headers={**HEADERS, "Accept-Language": "en-US"}, timeout=15)
+        if r.status_code == 200:
+            price = r.json().get("data", {}).get("primaryData", {}).get("lastSalePrice", "")
+            price = price.replace("$", "").replace(",", "")
+            if price:
+                return float(price)
+    except Exception as e:
+        print(f"  현재가 nasdaq 실패: {e}")
+    return 0
 
 def calc_wall_and_pain(df_exp):
     df_exp = df_exp.fillna(0)
@@ -161,21 +210,22 @@ def predict_direction(summary_row, current_price):
 
     dte = summary_row['days_to_expiry']
     weight = 1.5 if dte <= 7 else 1.0 if dte <= 30 else 0.5
-    if mp > current_price:
-        score += 25 * weight
-        reasons.append(f"맥스페인({mp})이 현재가보다 위 -> 위로 끌어당김")
-    elif mp < current_price:
-        score -= 25 * weight
-        reasons.append(f"맥스페인({mp})이 현재가보다 아래 -> 아래로 끌어당김")
+    if current_price and current_price > 0:
+        if mp > current_price:
+            score += 25 * weight
+            reasons.append(f"맥스페인({mp})이 현재가보다 위 -> 위로 끌어당김")
+        elif mp < current_price:
+            score -= 25 * weight
+            reasons.append(f"맥스페인({mp})이 현재가보다 아래 -> 아래로 끌어당김")
 
-    dist_call = (cw - current_price) / current_price * 100 if current_price else 0
-    dist_put = (current_price - pw) / current_price * 100 if current_price else 0
-    if dist_call < 2:
-        score -= 20
-        reasons.append(f"콜월({cw})까지 {dist_call:.1f}%밖에 안남음 -> 저항 강함")
-    if dist_put < 2:
-        score += 20
-        reasons.append(f"풋월({pw})까지 {dist_put:.1f}%밖에 안남음 -> 지지 강함")
+        dist_call = (cw - current_price) / current_price * 100
+        dist_put = (current_price - pw) / current_price * 100
+        if dist_call < 2:
+            score -= 20
+            reasons.append(f"콜월({cw})까지 {dist_call:.1f}%밖에 안남음 -> 저항 강함")
+        if dist_put < 2:
+            score += 20
+            reasons.append(f"풋월({pw})까지 {dist_put:.1f}%밖에 안남음 -> 지지 강함")
 
     if pcr > 1.2:
         score -= 15
@@ -184,10 +234,10 @@ def predict_direction(summary_row, current_price):
         score += 15
         reasons.append(f"Put/Call {pcr}로 콜 쏠림 -> 강세 베팅 많음")
 
-    if current_price > cw:
+    if current_price and current_price > cw:
         score += 10
         reasons.append("콜월 돌파 중 -> 상승 모멘텀")
-    if current_price < pw:
+    if current_price and current_price < pw:
         score -= 10
         reasons.append("풋월 이탈 중 -> 하락 모멘텀")
 
