@@ -11,9 +11,8 @@ DAYS_LIMIT = 365
 WHALE_PREMIUM = 1000000
 UNUSUAL_VOL_OI = 1.0
 WALL_SHARE = 0.15
-# OI 급증 판단 기준
-OI_SURGE_MIN = 500      # OI가 최소 이만큼은 늘어야 함
-OI_SURGE_PCT = 0.5      # 그리고 50% 이상 늘어야 함
+OI_SURGE_MIN = 500
+OI_SURGE_PCT = 0.5
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -65,20 +64,17 @@ def parse_occ_symbol(option_str, ticker_symbol):
 
 def load_prev_day_data(ticker_symbol, today_str):
     """어제(가장 최근) OI 데이터 불러오기 - 전일 비교용"""
-    # data/2026-11-19_DKNG.csv 같은 파일 찾기, 오늘 파일은 제외
     files = sorted(glob.glob(f"data/*_{ticker_symbol}.csv"))
-    # summary, alerts, predict 파일은 제외, 오늘 파일도 제외
     candidates = []
     for f in files:
         base = os.path.basename(f)
-        if "_summary" in base or "_alerts" in base or "_predict" in base:
+        if "_summary" in base or "_alerts" in base or "__predict" in base:
             continue
         if base.startswith(today_str):
             continue
         candidates.append(f)
     if not candidates:
         return None
-    # 가장 최근 파일
     prev_file = candidates[-1]
     try:
         df = pd.read_csv(prev_file)
@@ -89,34 +85,47 @@ def load_prev_day_data(ticker_symbol, today_str):
         return None
 
 def add_oi_change(df_today, df_prev):
-    """오늘 OI - 어제 OI 계산"""
+    """오늘 OI - 어제 OI 계산 (FIX 1: 전일 데이터 없으면 비교 안 함)"""
     df_today = df_today.copy()
-    df_today['prev_OI'] = 0
-    df_today['OI_change'] = 0
-    df_today['OI_change_pct'] = 0.0
+    has_prev = df_prev is not None and not df_prev.empty
+    df_today['has_prev'] = has_prev
 
-    if df_prev is None or df_prev.empty:
-        df_today['OI_change'] = df_today['openInterest']
+    if not has_prev:
+        # 첫날 / 전일 스냅샷 없음: 오늘 OI를 증가량으로 찍지 않는다
+        df_today['prev_OI'] = np.nan
+        df_today['OI_change'] = 0
+        df_today['OI_change_pct'] = 0.0
         return df_today
 
-    # 어제 데이터에서 키 만들기: 만기 + 타입 + 행사가
     prev_map = {}
     for _, r in df_prev.iterrows():
         key = (str(r.get('expiration')), str(r.get('type')), float(r.get('strike', 0)))
         prev_map[key] = safe_int(r.get('openInterest', 0))
 
     prev_ois = []
+    prev_exists = []
     for _, r in df_today.iterrows():
         key = (str(r['expiration']), str(r['type']), float(r['strike']))
-        prev_ois.append(prev_map.get(key, 0))
+        if key in prev_map:
+            prev_ois.append(prev_map[key])
+            prev_exists.append(True)
+        else:
+            # 신규 행사가 / 신규 만기: 어제 값이 없는 것이지 0이 아님
+            prev_ois.append(np.nan)
+            prev_exists.append(False)
 
     df_today['prev_OI'] = prev_ois
-    df_today['OI_change'] = df_today['openInterest'] - df_today['prev_OI']
-    # 어제 OI가 0이면 신규 포지션 -> 변화율 999%로 표시
+    df_today['prev_exists'] = prev_exists
+    # 어제 값이 있는 행만 변화량 계산, 없으면 0
+    df_today['OI_change'] = np.where(
+        df_today['prev_exists'],
+        df_today['openInterest'] - df_today['prev_OI'].fillna(0),
+        0
+    )
     df_today['OI_change_pct'] = np.where(
-        df_today['prev_OI'] > 0,
+        (df_today['prev_exists']) & (df_today['prev_OI'] > 0),
         df_today['OI_change'] / df_today['prev_OI'],
-        np.where(df_today['OI_change'] > 0, 9.99, 0)
+        0.0
     )
     return df_today
 
@@ -188,7 +197,6 @@ def get_all_options(ticker_symbol, today_str):
         return None, current_price
 
     df = pd.DataFrame(rows)
-    # 전일 OI 비교 추가 - 핵심!
     df_prev = load_prev_day_data(ticker_symbol, today_str)
     df = add_oi_change(df, df_prev)
     return df, current_price
@@ -205,7 +213,6 @@ def get_current_price(ticker_symbol):
                     return close
     except Exception as e:
         print(f"  현재가 stooq 실패: {e}")
-    # Nasdaq에서 stocks -> etf 순서로 둘 다 시도 (SOXL은 etf)
     for asset in ["stocks", "etf"]:
         try:
             r = requests.get(f"https://api.nasdaq.com/api/quote/{ticker_symbol}/info?assetclass={asset}", headers={**HEADERS, "Accept-Language": "en-US"}, timeout=15)
@@ -221,23 +228,40 @@ def get_current_price(ticker_symbol):
             print(f"  현재가 nasdaq({asset}) 실패: {e}")
     return 0
 
-def calc_wall_and_pain(df_exp):
+def calc_wall_and_pain(df_exp, current_price=0):
+    """FIX 4: 벽/맥스페인은 현재가 ±20% 안의 행사가만 사용"""
     df_exp = df_exp.fillna(0)
-    calls = df_exp[df_exp['type'] == 'CALL'].copy()
-    puts = df_exp[df_exp['type'] == 'PUT'].copy()
+    # 맥스페인/벽 계산용 필터 (현재가가 없으면 전체 사용 - 안전장치)
+    if current_price and current_price > 0:
+        df_near = df_exp[(df_exp['strike'] >= current_price * 0.8) & (df_exp['strike'] <= current_price * 1.2)].copy()
+        # 너무 적으면 필터 완화 (양쪽에 최소 3개씩은 있어야 함)
+        if len(df_near) < 6:
+            df_near = df_exp.copy()
+    else:
+        df_near = df_exp.copy()
+
+    calls = df_near[df_near['type'] == 'CALL'].copy()
+    puts = df_near[df_near['type'] == 'PUT'].copy()
     if calls.empty or puts.empty:
-        return None
+        # near에 한쪽이 없으면 전체로 폴백
+        calls = df_exp[df_exp['type'] == 'CALL'].copy()
+        puts = df_exp[df_exp['type'] == 'PUT'].copy()
+        if calls.empty or puts.empty:
+            return None
+        df_near = df_exp.copy()
+
     call_wall_row = calls.loc[calls['openInterest'].idxmax()]
     put_wall_row = puts.loc[puts['openInterest'].idxmax()]
-    strikes = np.sort(df_exp['strike'].unique())
+    strikes = np.sort(df_near['strike'].unique())
     call_pain = np.maximum(0, strikes[:, None] - calls['strike'].values[None, :]) @ calls['openInterest'].values
     put_pain = np.maximum(0, puts['strike'].values[None, :] - strikes[:, None]) @ puts['openInterest'].values
     max_pain_price = strikes[np.argmin(call_pain + put_pain)]
-    total_call_oi = calls['openInterest'].sum()
-    total_put_oi = puts['openInterest'].sum()
+    # 전체 OI / P/C는 near가 아니라 해당 만기 전체 기준 (기존과 동일)
+    total_call_oi = int(df_exp[df_exp['type'] == 'CALL']['openInterest'].sum())
+    total_put_oi = int(df_exp[df_exp['type'] == 'PUT']['openInterest'].sum())
     pc_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-    # 이 만기의 OI 순증가 / 순감소
     oi_net_change = int(df_exp['OI_change'].sum()) if 'OI_change' in df_exp.columns else 0
+    has_prev = bool(df_exp['has_prev'].iloc[0]) if 'has_prev' in df_exp.columns else False
     return {
         'call_wall': float(call_wall_row['strike']),
         'call_wall_OI': int(call_wall_row['openInterest']),
@@ -246,26 +270,26 @@ def calc_wall_and_pain(df_exp):
         'put_wall_OI': int(put_wall_row['openInterest']),
         'put_wall_OI_change': int(put_wall_row.get('OI_change', 0)),
         'max_pain': float(max_pain_price),
-        'total_call_OI': int(total_call_oi),
-        'total_put_OI': int(total_put_oi),
+        'total_call_OI': total_call_oi,
+        'total_put_OI': total_put_oi,
         'put_call_ratio': round(float(pc_ratio), 2),
         'total_premium': float(df_exp['premium_est'].sum()),
         'OI_net_change': oi_net_change,
+        'has_prev': has_prev,
     }
 
 def detect_whale_and_unusual(df_exp, current_price):
     alerts = []
     df_exp = df_exp.fillna(0)
+    has_prev = bool(df_exp['has_prev'].iloc[0]) if 'has_prev' in df_exp.columns else False
 
-    # 0. OI 급증 - NEW! 고래가 새로 들어온 자리
-    if 'OI_change' in df_exp.columns:
-        surge = df_exp[(df_exp['OI_change'] >= OI_SURGE_MIN) & (df_exp['OI_change_pct'] >= OI_SURGE_PCT)].sort_values('OI_change', ascending=False)
+    # FIX 2: 전일 데이터가 없으면 OI_SURGE / OI_DROP 자체를 스킵
+    if has_prev and 'OI_change' in df_exp.columns:
+        # 신규 행사가(prev_exists=False)는 surge에서 제외
+        base = df_exp[df_exp.get('prev_exists', True) == True] if 'prev_exists' in df_exp.columns else df_exp
+        surge = base[(base['OI_change'] >= OI_SURGE_MIN) & (base['OI_change_pct'] >= OI_SURGE_PCT)].sort_values('OI_change', ascending=False)
         for _, r in surge.head(8).iterrows():
-            # 신규 포지션인지, 기존에 더 쌓은 건지 구분
-            if r['prev_OI'] == 0:
-                kind = "신규 대량 진입"
-            else:
-                kind = "기존 포지션 대폭 증가"
+            kind = "기존 포지션 대폭 증가"
             alerts.append({
                 'level': 'OI_SURGE',
                 'msg': f"{r['type']} {r['strike']} OI {int(r['prev_OI'])} -> {int(r['openInterest'])} (+{int(r['OI_change'])}, +{r['OI_change_pct']*100:.0f}%) [{kind}] / 거래량 {int(r['volume'])}",
@@ -273,8 +297,7 @@ def detect_whale_and_unusual(df_exp, current_price):
                 'premium': float(r['premium_est']),
                 'type': r['type']
             })
-        # OI 급감 - 고래가 빠진 자리도 중요
-        drop = df_exp[df_exp['OI_change'] <= -OI_SURGE_MIN].sort_values('OI_change').head(5)
+        drop = base[base['OI_change'] <= -OI_SURGE_MIN].sort_values('OI_change').head(5)
         for _, r in drop.iterrows():
             alerts.append({
                 'level': 'OI_DROP',
@@ -286,9 +309,10 @@ def detect_whale_and_unusual(df_exp, current_price):
 
     whales = df_exp[df_exp['premium_est'] >= WHALE_PREMIUM].sort_values('premium_est', ascending=False)
     for _, r in whales.head(5).iterrows():
+        prev_txt = f" (전일 OI {int(r['prev_OI'])})" if has_prev and pd.notna(r.get('prev_OI', np.nan)) else " (전일 OI - 기준 수집 중)"
         alerts.append({
             'level': 'WHALE',
-            'msg': f"{r['type']} {r['strike']} 행사가 프리미엄 ${r['premium_est']:,.0f} / 거래량 {int(r['volume'])} / OI {int(r['openInterest'])} (전일 OI {int(r.get('prev_OI', 0))})",
+            'msg': f"{r['type']} {r['strike']} 행사가 프리미엄 ${r['premium_est']:,.0f} / 거래량 {int(r['volume'])} / OI {int(r['openInterest'])}{prev_txt}",
             'strike': float(r['strike']),
             'premium': float(r['premium_est']),
             'type': r['type']
@@ -322,6 +346,7 @@ def detect_whale_and_unusual(df_exp, current_price):
     return alerts
 
 def predict_direction(summary_row, current_price):
+    """FIX 3: 돌파/이탈 분기 분리 + 중복 제거 + 첫날 OI 문구 제외"""
     score = 0
     reasons = []
     cw = summary_row['call_wall']
@@ -329,6 +354,7 @@ def predict_direction(summary_row, current_price):
     mp = summary_row['max_pain']
     pcr = summary_row['put_call_ratio']
     dte = summary_row['days_to_expiry']
+    has_prev = summary_row.get('has_prev', True)
     weight = 1.5 if dte <= 7 else 1.0 if dte <= 30 else 0.5
     if current_price and current_price > 0:
         if mp > current_price:
@@ -339,30 +365,35 @@ def predict_direction(summary_row, current_price):
             reasons.append(f"맥스페인({mp})이 현재가보다 아래 -> 아래로 끌어당김")
         dist_call = (cw - current_price) / current_price * 100
         dist_put = (current_price - pw) / current_price * 100
-        if dist_call < 2:
+        # 콜월: 위에 있을 때만 저항, 이미 위면 돌파 (둘 다 들어가지 않음)
+        if 0 <= dist_call < 2:
             score -= 20
             reasons.append(f"콜월({cw})까지 {dist_call:.1f}%밖에 안남음 -> 저항 강함")
-        if dist_put < 2:
+        elif dist_call < 0:
+            score += 10
+            reasons.append(f"콜월({cw}) 돌파 중 -> 상승 모멘텀")
+        # 풋월: 아래에 있을 때만 지지, 이미 아래면 이탈
+        if 0 <= dist_put < 2:
             score += 20
             reasons.append(f"풋월({pw})까지 {dist_put:.1f}%밖에 안남음 -> 지지 강함")
+        elif dist_put < 0:
+            score -= 10
+            reasons.append(f"풋월({pw}) 이탈 중 -> 하락 모멘텀")
     if pcr > 1.2:
         score -= 15
         reasons.append(f"Put/Call {pcr}로 풋 쏠림 -> 공포 / 하락 베팅 많음")
     elif pcr < 0.7:
         score += 15
         reasons.append(f"Put/Call {pcr}로 콜 쏠림 -> 강세 베팅 많음")
-    if current_price and current_price > cw:
-        score += 10
-        reasons.append("콜월 돌파 중 -> 상승 모멘텀")
-    if current_price and current_price < pw:
-        score -= 10
-        reasons.append("풋월 이탈 중 -> 하락 모멘텀")
-    # OI 순증가 반영 - NEW!
-    oi_net = summary_row.get('OI_net_change', 0)
-    if oi_net > 5000:
-        reasons.append(f"전체 OI가 어제보다 {oi_net} 증가 -> 새로운 돈 유입 중")
-    elif oi_net < -5000:
-        reasons.append(f"전체 OI가 어제보다 {abs(oi_net)} 감소 -> 포지션 정리 중")
+    # OI 순증가: 전일 데이터가 있을 때만 문구 표시 (점수에는 반영 안 함 - 기존과 동일)
+    if has_prev:
+        oi_net = summary_row.get('OI_net_change', 0)
+        if oi_net > 5000:
+            reasons.append(f"전체 OI가 어제보다 {oi_net} 증가 -> 새로운 돈 유입 중")
+        elif oi_net < -5000:
+            reasons.append(f"전체 OI가 어제보다 {abs(oi_net)} 감소 -> 포지션 정리 중")
+    else:
+        reasons.append("OI 전일 대비: 기준 데이터 수집 중 (내일부터 비교 가능)")
     score = max(-100, min(100, score))
     if score >= 40:
         verdict = "🟢 강세 우위"
@@ -392,12 +423,12 @@ def main():
             print(f"{ticker_symbol} 데이터 없음 - 건너뜀")
             continue
         cols = ['ticker','expiration','days_to_expiry','type','strike','lastPrice','bid','ask',
-                'volume','openInterest','prev_OI','OI_change','OI_change_pct','impliedVolatility','mid_price','premium_est','vol_oi_ratio','current_price']
+                'volume','openInterest','prev_OI','OI_change','OI_change_pct','impliedVolatility','mid_price','premium_est','vol_oi_ratio','current_price','has_prev','prev_exists']
         cols = [c for c in cols if c in df.columns]
         df[cols].to_csv(f'data/{today_str}_{ticker_symbol}.csv', index=False)
         for exp in sorted(df['expiration'].unique()):
             df_exp = df[df['expiration'] == exp]
-            result = calc_wall_and_pain(df_exp)
+            result = calc_wall_and_pain(df_exp, current_price)
             if not result:
                 continue
             dte = int(df_exp.iloc[0]['days_to_expiry'])
@@ -433,7 +464,7 @@ def main():
         predict_df.to_csv(f'data/{today_str}_predict.csv', index=False)
     with open('summary.md', 'w', encoding='utf-8') as f:
         f.write(f"# Option Wall + Whale + OI변화 + 예측 - {today_str}\n\n")
-        f.write("> ⚠️ 이 예측은 옵션 포지셔닝 기반 참고용입니다. 확정적인 방향이 아닙니다. 현물 거래의 보조 지표로만 사용하세요.\n\n")
+        f.write("> ⚠ 이 예측은 옵션 포지셔닝 기반 참고용입니다. 확정적인 방향이 아닙니다. 현물 거래의 보조 지표로만 사용하세요.\n\n")
         if not predict_df.empty:
             f.write("## 🎯 방향 예측 (가까운 만기 3개 기준)\n\n")
             f.write("| 종목 | 만기 | D-day | 현재가 | 콜월 | 풋월 | 맥스페인 | 점수 | 판단 |\n|---|---|---|---|---|---|---|---|---|\n")
@@ -443,7 +474,6 @@ def main():
             for _, r in predict_df.iterrows():
                 f.write(f"- **{r['ticker']} {r['expiration']} ({r['verdict']})**: {r['reasons']}\n")
             f.write("\n")
-        # OI 급증만 따로 모아서 최상단에 보여주기 - NEW!
         if not alert_df.empty:
             oi_surge = alert_df[alert_df['level'] == 'OI_SURGE']
             if not oi_surge.empty:
@@ -482,7 +512,7 @@ def main():
                     elif r['level'] == 'WHALE':
                         emoji = "🐋"
                     elif r['level'] == 'UNUSUAL':
-                        emoji = "⚠️"
+                        emoji = "⚠"
                     else:
                         emoji = "🧱"
                     f.write(f"- {emoji} [{r['expiration']}] {r['msg']}\n")
@@ -498,7 +528,11 @@ def main():
                 f.write(f"### {ticker_symbol} - 현재가 {sub.iloc[0]['current_price']}\n\n")
                 f.write("| 만기 | D-day | 콜월 | 콜월 OI변화 | 풋월 | 풋월 OI변화 | 맥스페인 | P/C | OI순증가 |\n|---|---|---|---|---|---|---|---|---|\n")
                 for _, r in sub.iterrows():
-                    f.write(f"| {r['expiration']} | {r['days_to_expiry']} | {r['call_wall']} | {r.get('call_wall_OI_change', 0):+} | {r['put_wall']} | {r.get('put_wall_OI_change', 0):+} | {r['max_pain']} | {r['put_call_ratio']} | {r.get('OI_net_change', 0):+} |\n")
+                    # 첫날은 OI순증가를 0으로 표시 (가짜 증가 방지)
+                    oi_net = 0 if not r.get('has_prev', True) else r.get('OI_net_change', 0)
+                    cw_change = 0 if not r.get('has_prev', True) else r.get('call_wall_OI_change', 0)
+                    pw_change = 0 if not r.get('has_prev', True) else r.get('put_wall_OI_change', 0)
+                    f.write(f"| {r['expiration']} | {r['days_to_expiry']} | {r['call_wall']} | {cw_change:+} | {r['put_wall']} | {pw_change:+} | {r['max_pain']} | {r['put_call_ratio']} | {oi_net:+} |\n")
                 f.write("\n")
     print("완료 - summary.md 생성")
 
