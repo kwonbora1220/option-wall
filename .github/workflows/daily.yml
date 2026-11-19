@@ -1,33 +1,24 @@
 name: Daily Option Wall
-
 on:
   schedule:
-    # 매일 한국시간 아침 6:30 = UTC 21:30 (전날)
     - cron: '30 21 * * *'
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-
+        run: pip install -r requirements.txt
       - name: Run main.py
         run: python main.py
-
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
@@ -35,48 +26,38 @@ jobs:
           git add data/ summary.md
           git commit -m "Daily update $(date +'%Y-%m-%d')" || echo "No changes"
           git push
-
-      - name: Send to Telegram
+      - name: Send to Telegram - NEVER truncate, split by lines
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -c "
           import os, requests, time
-
           token = os.environ['TELEGRAM_BOT_TOKEN']
           chat_id = os.environ['TELEGRAM_CHAT_ID']
-
           with open('summary.md', 'r', encoding='utf-8') as f:
               text = f.read()
-
-          # FIX: 문자 수로 잘라서 보내면 표 중간이 잘리고, 7000자 이후는 아예 사라짐.
-          # 줄 단위로 끊어서 4000자 이하 청크로 나눈다. (텔레그램 제한 4096자, 여유 둠)
-          # FIX: parse_mode=Markdown은 |, _, * 같은 문자 때문에 전송 실패/깨짐이 잦다.
-          # summary.md는 표가 많아서 parse_mode를 빼고 순수 텍스트로 보내는 게 가장 안전하다.
-          MAX_LEN = 3900
+          # 핵심: text[:3500], text[3500:7000] 처럼 자르면 BE가 잘린다. 절대 사용 금지.
+          # 줄 단위로 3800자 이하로 나눠서 끝까지 전부 보낸다.
+          MAX_LEN = 3800
           chunks = []
-          current = '📊 오늘 옵션월 리포트\n\n'
+          current = ''
           for line in text.splitlines(True):
-              # 한 줄이 너무 길면 그 줄만 잘라서 나눔 (테이블 행이 길 경우 대비)
+              # 한 줄이 너무 길면 그 줄만 쪼갬 (표 행 대비)
               while len(line) > MAX_LEN:
-                  chunks.append(line[:MAX_LEN])
-                  line = line[MAX_LEN:]
+                  chunks.append(line[:MAX_LEN]); line = line[MAX_LEN:]
               if len(current) + len(line) > MAX_LEN:
-                  chunks.append(current)
-                  current = ''
+                  chunks.append(current); current = ''
               current += line
           if current.strip():
               chunks.append(current)
-
+          total = len(chunks)
+          print(f'Telegram: total {total} chunks, {len(text)} chars -> will send ALL')
           for i, chunk in enumerate(chunks):
-              r = requests.post(
-                  f'https://api.telegram.org/bot{token}/sendMessage',
-                  json={'chat_id': chat_id, 'text': chunk, 'disable_web_page_preview': True},
-                  timeout=30,
-              )
-              print(f'Telegram send {i+1}/{len(chunks)}:', r.status_code, r.text[:300])
+              body = f'📊 오늘 옵션월 리포트 ({i+1}/{total})\n\n' + chunk if total > 1 else '📊 오늘 옵션월 리포트\n\n' + chunk
+              r = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': body, 'disable_web_page_preview': True}, timeout=30)
+              print(f'Telegram send {i+1}/{total}:', r.status_code, r.text[:300])
               if r.status_code != 200:
                   raise SystemExit(f'Telegram send failed: {r.text[:500]}')
-              time.sleep(0.5)
+              time.sleep(0.7)
           "
