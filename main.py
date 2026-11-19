@@ -88,8 +88,15 @@ def get_price_with_check(ticker):
         except Exception as e: print(f"  nasdaq 실패: {e}")
     price=stooq_p if stooq_p>0 else nasdaq_p
     source="stooq(종가)" if stooq_p>0 else ("nasdaq" if nasdaq_p>0 else "없음")
-    diff=abs(stooq_p-nasdaq_p)/stooq_p*100 if stooq_p>0 and nasdaq_p>0 else 0.0
-    flag="✅" if diff<1.0 else "⚠ 소스간 차이 1%↑"
+    if stooq_p>0 and nasdaq_p>0:
+        diff=abs(stooq_p-nasdaq_p)/stooq_p*100
+        flag="✅" if diff<1.0 else "⚠ 소스간 차이 1%↑"
+    elif stooq_p>0 or nasdaq_p>0:
+        diff=-1.0
+        flag="⚠ 단일 소스만 (stooq 0)"
+    else:
+        diff=-1.0
+        flag="❌ 가격 소스 없음"
     print(f"  {ticker} 가격 stooq={stooq_p} nasdaq={nasdaq_p} 사용={price} ({source}) 차이={diff:.2f}% {flag}")
     return price,source,round(float(stooq_p),2),round(float(nasdaq_p),2),round(float(diff),2),flag
 
@@ -128,7 +135,7 @@ def get_all_options(ticker,today_str):
             bid=safe_float(o.get("bid",0)); ask=safe_float(o.get("ask",0))
             vol=safe_int(o.get("volume",0)); oi=safe_int(o.get("open_interest",0))
             mid=(bid+ask)/2; spread=(ask-bid)/mid if mid>0 else 1.0
-            rows.append({'ticker':ticker,'expiration':exp_str,'days_to_expiry':(exp_date-today).days,'type':typ,'strike':strike,'lastPrice':safe_float(o.get("last_trade_price",0)),'bid':bid,'ask':ask,'volume':vol,'openInterest':oi,'impliedVolatility':safe_float(o.get("iv",0)),'mid_price':mid,'spread_pct':spread,'premium_est':vol*mid*100,'vol_oi_ratio':vol/oi if oi>0 else 0,'current_price':price})
+            rows.append({'ticker':ticker,'expiration':exp_str,'days_to_expiry':(exp_date.date()-today.date()).days,'type':typ,'strike':strike,'lastPrice':safe_float(o.get("last_trade_price",0)),'bid':bid,'ask':ask,'volume':vol,'openInterest':oi,'impliedVolatility':safe_float(o.get("iv",0)),'mid_price':mid,'spread_pct':spread,'premium_est':vol*mid*100,'vol_oi_ratio':vol/oi if oi>0 else 0,'current_price':price})
         except Exception as e:
             print(f"  옵션 파싱 실패 (무시): {e}"); continue
     print(f"  {ticker} 파싱 결과: 성공 {len(rows)}개")
@@ -156,7 +163,7 @@ def calc_wall_and_pain(df_exp,price=0):
     tc=int(df_exp[df_exp['type']=='CALL']['openInterest'].sum()); tp=int(df_exp[df_exp['type']=='PUT']['openInterest'].sum())
     return {'call_wall':float(cw['strike']),'call_wall_OI':int(cw['openInterest']),'call_wall_OI_change':int(cw.get('OI_change',0)),'put_wall':float(pw['strike']),'put_wall_OI':int(pw['openInterest']),'put_wall_OI_change':int(pw.get('OI_change',0)),'max_pain':float(mp),'total_call_OI':tc,'total_put_OI':tp,'put_call_ratio':round(float(tp/tc if tc>0 else 0),2),'total_premium':float(df_exp['premium_est'].sum()),'OI_net_change':int(df_exp['OI_change'].sum()) if 'OI_change' in df_exp.columns else 0,'has_prev':bool(df_exp['has_prev'].iloc[0]) if 'has_prev' in df_exp.columns else False}
 
-def detect_whale(df_exp):
+def detect_whale(df_exp, price=0):
     alerts=[]; df_exp=df_exp.fillna(0); has_prev=bool(df_exp['has_prev'].iloc[0]) if 'has_prev' in df_exp.columns else False
     if has_prev and 'OI_change' in df_exp.columns:
         base=df_exp[df_exp.get('prev_exists',True)==True] if 'prev_exists' in df_exp.columns else df_exp
@@ -165,7 +172,11 @@ def detect_whale(df_exp):
         for _,r in base[base['OI_change']<=-OI_SURGE_MIN].sort_values('OI_change').head(5).iterrows():
             alerts.append({'level':'OI_DROP','msg':f"{r['type']} {r['strike']} OI {int(r['prev_OI'])} -> {int(r['openInterest'])} ({int(r['OI_change'])}) [이탈/청산 의심]",'strike':float(r['strike']),'premium':float(r['premium_est']),'type':r['type']})
     seen=set()
-    for _,r in df_exp[(df_exp['premium_est']>=WHALE_PREMIUM)&(df_exp['spread_pct']<=MAX_SPREAD_PCT_FOR_WHALE)].sort_values('premium_est',ascending=False).head(5).iterrows():
+    # v4: OI 100 미만 + 현재가 ±30% 밖 제외 (META 410/405, SOXL PUT 120 가짜 고래 제거)
+    _whale = df_exp[(df_exp['premium_est']>=WHALE_PREMIUM)&(df_exp['spread_pct']<=MAX_SPREAD_PCT_FOR_WHALE)&(df_exp['openInterest']>=100)]
+    if price and price>0:
+        _whale = _whale[(_whale['strike']>=price*0.7)&(_whale['strike']<=price*1.3)]
+    for _,r in _whale.sort_values('premium_est',ascending=False).head(5).iterrows():
         pt=f" (전일 OI {int(r['prev_OI'])})" if has_prev and pd.notna(r.get('prev_OI',np.nan)) else " (전일 OI - 기준 수집 중)"
         alerts.append({'level':'WHALE','msg':f"{r['type']} {r['strike']} 프리미엄 ${r['premium_est']:,.0f} / 거래량 {int(r['volume'])} / OI {int(r['openInterest'])}{pt}",'strike':float(r['strike']),'premium':float(r['premium_est']),'type':r['type']}); seen.add((r['type'],float(r['strike'])))
     for _,r in df_exp[(df_exp['vol_oi_ratio']>=UNUSUAL_VOL_OI)&(df_exp['openInterest']>=MIN_OI_FOR_UNUSUAL)].sort_values('vol_oi_ratio',ascending=False).head(5).iterrows():
@@ -234,7 +245,7 @@ def main():
             if not res: continue
             dte=int(de.iloc[0]['days_to_expiry']); row={'date':today_str,'ticker':t,'current_price':round(float(price),2) if price else 0,'expiration':exp,'days_to_expiry':dte,**res}; srows.append(row)
             if dte<=45:
-                for a in detect_whale(de): arows.append({'date':today_str,'ticker':t,'expiration':exp,'days_to_expiry':dte,**a})
+                for a in detect_whale(de, price): arows.append({'date':today_str,'ticker':t,'expiration':exp,'days_to_expiry':dte,**a})
             if exp in sorted(df['expiration'].unique())[:3]:
                 sc,ve,rs=predict(row,price); prows.append({'date':today_str,'ticker':t,'expiration':exp,'days_to_expiry':dte,'current_price':row['current_price'],'call_wall':row['call_wall'],'put_wall':row['put_wall'],'max_pain':row['max_pain'],'score':sc,'verdict':ve,'reasons':" | ".join(rs)})
         print(f"{t} 완료")
@@ -250,7 +261,9 @@ def main():
     lines=[f"# Option Wall + Whale + OI변화 + 예측 - {today_str}\n\n",f"수집 시각: {collected} / 기준 날짜(KST): {today_str}\n\n","> ⚠ 옵션 포지셔닝 기반 참고용입니다. 확정적인 방향이 아닙니다.\n\n"]
     if not vdf.empty:
         lines.append("## ✅ 가격 검증 (수집가 vs 외부 소스)\n\n"); lines.append("| 종목 | 사용한 가격 | stooq(종가) | nasdaq | 차이 | 판정 |\n|---|---|---|---|---|---|\n")
-        for _,r in vdf.iterrows(): lines.append(f"| {r['ticker']} | {r['used_price']} | {r['stooq_price']} | {r['nasdaq_price']} | {r['price_diff_pct']}% | {r['price_flag']} |\n")
+        for _,r in vdf.iterrows():
+            _d=float(r['price_diff_pct']); _dtxt='비교불가' if _d<0 else f"{_d}%"
+            lines.append(f"| {r['ticker']} | {r['used_price']} | {r['stooq_price']} | {r['nasdaq_price']} | {_dtxt} | {r['price_flag']} |\n")
         lines.append("\n> 가격은 수집 시점 스냅샷입니다. 두 소스가 1% 이상 벌어지면 ⚠가 뜹니다.\n\n")
     if not pdf.empty:
         lines.append("## 🎯 방향 예측 (가까운 만기 3개 기준)\n\n"); lines.append("| 종목 | 만기 | D-day | 현재가 | 콜월 | 풋월 | 맥스페인 | 점수 | 판단 |\n|---|---|---|---|---|---|---|---|---|\n")
