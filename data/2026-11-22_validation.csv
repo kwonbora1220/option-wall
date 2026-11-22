@@ -1,0 +1,7 @@
+date,collected_at,ticker,used_price,price_source,stooq_price,nasdaq_price,price_diff_pct,price_flag
+2026-11-22,2026-11-22 10:29 KST,DKNG,0,CBOE 실패,0,0,-1,❌ CBOE 3회 실패 / 잠시 뒤 재실행
+2026-11-22,2026-11-22 10:29 KST,RKLB,0,CBOE 실패,0,0,-1,❌ CBOE 3회 실패 / 잠시 뒤 재실행
+2026-11-22,2026-11-22 10:29 KST,WULF,0,CBOE 실패,0,0,-1,❌ CBOE 3회 실패 / 잠시 뒤 재실행
+2026-11-22,2026-11-22 10:29 KST,SOXL,0,CBOE 실패,0,0,-1,❌ CBOE 3회 실패 / 잠시 뒤 재실행
+2026-11-22,2026-11-22 10:29 KST,META,0,CBOE 실패,0,0,-1,❌ CBOE 3회 실패 / 잠시 뒤 재실행
+2026-11-22,2026-11-22 10:29 KST,BE,0,CBOE 실패,0,0,-1,❌ CBOE 3회 실패 / 잠시 뒤 재실행
